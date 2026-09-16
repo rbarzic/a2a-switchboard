@@ -49,7 +49,10 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
         // an empty token yields None — a "" credential must never classify
         // (empty Persisted token fields would otherwise match trivially).
         let mut parts = v.split_whitespace();
-        if parts.next().is_some_and(|s| s.eq_ignore_ascii_case("bearer")) {
+        if parts
+            .next()
+            .is_some_and(|s| s.eq_ignore_ascii_case("bearer"))
+        {
             return parts
                 .next()
                 .map(str::trim)
@@ -108,7 +111,9 @@ pub fn forbidden() -> Response {
 pub fn too_many() -> Response {
     let mut res = rpc_err(StatusCode::TOO_MANY_REQUESTS, -32003, "rate limit exceeded");
     // Fixed 60s window — tell well-behaved clients (pi-a2a, hermes) when to retry.
-    res.headers_mut()
-        .insert(header::RETRY_AFTER, axum::http::HeaderValue::from_static("60"));
+    res.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("60"),
+    );
     res
 }

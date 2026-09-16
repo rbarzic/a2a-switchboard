@@ -365,7 +365,8 @@ async fn channel_roundtrip_full() {
     // Register a peer with an UNROUTABLE url — proves the channel path, not
     // direct HTTP, carries the request.
     let (router, app, _gw, boot) = test_app().await;
-    let reg = r#"{"name":"fw","url":"http://127.0.0.1:1/","upstream_token":"ut-fw-secret"}"#.to_string();
+    let reg =
+        r#"{"name":"fw","url":"http://127.0.0.1:1/","upstream_token":"ut-fw-secret"}"#.to_string();
     let r = router
         .clone()
         .oneshot(req("POST", "/register", Some(&boot), Some(&reg)))
@@ -755,10 +756,7 @@ async fn bearer_scheme_is_case_insensitive_and_empty_tokens_are_absent() {
     // though a stored token could theoretically be "".
     let r = router
         .clone()
-        .oneshot(
-            req("POST", "/register", None, Some(body))
-                .with_header("authorization", "Bearer "),
-        )
+        .oneshot(req("POST", "/register", None, Some(body)).with_header("authorization", "Bearer "))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
@@ -766,10 +764,7 @@ async fn bearer_scheme_is_case_insensitive_and_empty_tokens_are_absent() {
     // Empty X-Gateway-Token (whitespace only) → absent → 401.
     let r = router
         .clone()
-        .oneshot(
-            req("POST", "/register", None, Some(body))
-                .with_header("x-gateway-token", "  "),
-        )
+        .oneshot(req("POST", "/register", None, Some(body)).with_header("x-gateway-token", "  "))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
