@@ -103,9 +103,13 @@ the operator (admin UI delete → re-register), never via a shared token.
 
 ## Rate limits
 
-Per-IP **rolling 60s window**: 20/min registration, 120/min proxy, channel
-responses, and `/.well-known/agent.json`. No fixed-window boundary burst.
-Channel queue depth 256; excess is 503 (retryable), not a silent drop.
+All limits use a **rolling 60s window**. An authenticated `PATCH /register`
+with the target peer's own caller token has a **20/min per-peer** budget,
+independent of the peer's source IP. Admission and ownership checks still apply.
+`POST /register`, `DELETE /register`, and other `PATCH /register` requests share
+an independent **20/min per-IP** registration budget. Proxy calls, channel
+responses, and `/.well-known/agent.json` retain their **120/min per-IP** budget.
+Channel queue depth is 256; excess is 503 (retryable), not a silent drop.
 
 ## Reporting
 

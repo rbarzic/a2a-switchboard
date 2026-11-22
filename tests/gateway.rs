@@ -737,6 +737,140 @@ async fn rate_limited_registration() {
 }
 
 #[tokio::test]
+async fn peer_heartbeats_scale_behind_one_ip_without_using_the_enrollment_budget() {
+    let (router, _app, gw, _boot) = test_app().await;
+    let mut tokens = Vec::new();
+    for i in 1..=50 {
+        // Enroll gradually, simulated here with distinct source IPs. Both
+        // leases and directory refreshes then come through a single proxy IP.
+        let mut enroll = req(
+            "POST",
+            "/register",
+            Some(&gw),
+            Some(&format!(
+                r#"{{"name":"peer-{i}","url":"http://127.0.0.1:1/"}}"#
+            )),
+        );
+        enroll
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [192, 0, 2, i],
+                40000,
+            ))));
+        let r = router.clone().oneshot(enroll).await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        tokens.push(
+            body_json(r).await["caller_token"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let patch = |i: usize| {
+        req(
+            "PATCH",
+            "/register",
+            Some(&tokens[i - 1]),
+            Some(&format!(r#"{{"name":"peer-{i}"}}"#)),
+        )
+    };
+
+    // Requests without ConnectInfo use the same source key ("unknown").
+    for i in 1..=50 {
+        let r = router.clone().oneshot(patch(i)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "heartbeat from peer-{i}");
+        let r = router
+            .clone()
+            .oneshot(req("GET", "/.well-known/agent.json", Some(&gw), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "directory refresh for peer-{i}");
+    }
+
+    // The first peer cannot consume the second peer's heartbeat budget.
+    for _ in 1..20 {
+        let r = router.clone().oneshot(patch(1)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let r = router.clone().oneshot(patch(1)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.headers()["retry-after"], "60");
+    let r = router.clone().oneshot(patch(2)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // Neither the heartbeats nor the GET traffic used up the enrollment quota.
+    let r = router
+        .oneshot(req(
+            "POST",
+            "/register",
+            Some(&gw),
+            Some(r#"{"name":"new-peer","url":"http://127.0.0.1:1/"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn patch_without_the_targets_token_stays_in_the_registration_ip_bucket() {
+    let (router, _app, gw, _boot) = test_app().await;
+    let r = router
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/register",
+            Some(&gw),
+            Some(r#"{"name":"owner","url":"http://127.0.0.1:1/"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let body = body_json(r).await;
+    let owner_token = body["caller_token"].as_str().unwrap();
+    let own_body = Some(r#"{"name":"owner"}"#);
+    let other_body = Some(r#"{"name":"other"}"#);
+    let cases = [
+        (None, own_body, StatusCode::UNAUTHORIZED),
+        (Some("invalid"), own_body, StatusCode::UNAUTHORIZED),
+        (Some(gw.as_str()), own_body, StatusCode::CONFLICT),
+        (Some(owner_token), other_body, StatusCode::NOT_FOUND),
+    ];
+    for i in 0..19 {
+        let (token, body, expected) = cases[i % cases.len()];
+        let r = router
+            .clone()
+            .oneshot(req("PATCH", "/register", token, body))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), expected);
+    }
+    for (token, body, _) in cases {
+        let r = router
+            .clone()
+            .oneshot(req("PATCH", "/register", token, body))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    let r = router
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/register?name=owner",
+            Some(owner_token),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    let r = router
+        .oneshot(req("PATCH", "/register", Some(owner_token), own_body))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn bearer_scheme_is_case_insensitive_and_empty_tokens_are_absent() {
     let (router, _app, gw, _boot) = test_app().await;
     let body = r#"{"name":"tok-edge","url":"http://127.0.0.1:1/"}"#;

@@ -13,6 +13,12 @@ use axum::Json;
 use serde::Deserialize;
 
 const MAX_PROXY_BYTES: usize = 4 * 1024 * 1024;
+const REGISTRATION_LIMIT_PER_MIN: u32 = 20;
+
+fn allow_registration_from(app: &AppState, ip: &str) -> bool {
+    app.limiter
+        .allow(&format!("registration:ip:{ip}"), REGISTRATION_LIMIT_PER_MIN)
+}
 // Must exceed pi-a2a replyTimeoutSec (default 300s) — agent tasks run long.
 const PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -37,7 +43,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(reg): Json<RegBody>,
 ) -> Response {
-    if !app.limiter.allow(&client_ip, 20) {
+    if !allow_registration_from(&app, &client_ip) {
         return too_many();
     }
     let Some(token) = extract_token(&headers) else {
@@ -184,7 +190,7 @@ pub async fn deregister(
     headers: HeaderMap,
     Query(q): Query<DeregQuery>,
 ) -> Response {
-    if !app.limiter.allow(&client_ip, 20) {
+    if !allow_registration_from(&app, &client_ip) {
         return too_many();
     }
     let Some(token) = extract_token(&headers) else {
@@ -240,13 +246,39 @@ pub async fn update(
     headers: HeaderMap,
     Json(p): Json<PatchBody>,
 ) -> Response {
-    if !app.limiter.allow(&client_ip, 20) {
+    let token = extract_token(&headers);
+    let name = p.name.trim();
+    // A peer behind a shared IP (e.g. SSH forwarding) gets its own budget
+    // only when its caller token authenticates the exact target. Other
+    // requests, including legacy/shared tokens, stay in the registration IP
+    // bucket. Directory and proxy traffic cannot consume that budget.
+    let own_token = if let Some(token) = token.as_deref() {
+        let inner = app.inner.read().await;
+        classify_token(token, &inner.gateway_token, &inner.bootstrap_token).is_none()
+            && inner.peers.iter().any(|peer| {
+                peer.name == name
+                    && peer
+                        .caller_token
+                        .as_deref()
+                        .is_some_and(|expected| crate::auth::ct_eq(expected, token))
+            })
+    } else {
+        false
+    };
+    let allowed = if own_token {
+        app.limiter.allow(
+            &format!("registration:peer:{name}"),
+            REGISTRATION_LIMIT_PER_MIN,
+        )
+    } else {
+        allow_registration_from(&app, &client_ip)
+    };
+    if !allowed {
         return too_many();
     }
-    let Some(token) = extract_token(&headers) else {
+    let Some(token) = token else {
         return unauthorized();
     };
-    let name = p.name.trim().to_string();
     if let Some(u) = p.url.as_deref() {
         if let Err(e) = validate_url(u) {
             return err(StatusCode::UNPROCESSABLE_ENTITY, &format!("url: {e}"));
@@ -267,24 +299,34 @@ pub async fn update(
         }
     }
 
-    // Resolve the token to an identity BEFORE taking the write lock (the
-    // resolver acquires its own read lock) and BEFORE the name lookup: a token
-    // that is neither shared nor any peer's caller_token must 401 without
-    // disclosing whether the name exists (pending/revoked peers are unlisted
-    // by design).
-    let caller = match resolve_caller(&app, &token).await {
-        Some(c) => c,
-        None => return unauthorized(),
+    // Resolve remaining callers before the protected lookup so unknown
+    // tokens get 401 without revealing whether a target peer exists.
+    let caller = if own_token {
+        Caller::Peer(name.to_owned())
+    } else {
+        match resolve_caller(&app, &token).await {
+            Some(c) => c,
+            None => return unauthorized(),
+        }
     };
-    let fp = fingerprint(&token);
     let mut inner = app.inner.write().await;
     let Some(idx) = inner.peers.iter().position(|x| x.name == name) else {
         return err(StatusCode::NOT_FOUND, "no such peer");
     };
-    // Authorization: the peer's own caller token, or (legacy entries without
-    // one only) the exact shared token that registered them. Any other shared
-    // token is a different fleet identity → 409 (issue #3).
-    if !may_manage(&caller, &inner.peers[idx], &fp) {
+    let peer = &inner.peers[idx];
+    // Recheck the token under the write lock: a registration could have
+    // been deleted and recreated with the same name since authentication.
+    let can_manage = match &caller {
+        Caller::Peer(owner) => {
+            owner == &peer.name
+                && peer
+                    .caller_token
+                    .as_deref()
+                    .is_some_and(|expected| crate::auth::ct_eq(expected, &token))
+        }
+        Caller::Shared(_) => may_manage(&caller, peer, &fingerprint(&token)),
+    };
+    if !can_manage {
         return err(StatusCode::CONFLICT, "peer registered by another identity");
     }
     if inner.peers[idx].state == PeerState::Revoked {

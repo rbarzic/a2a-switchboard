@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Authenticated registration heartbeats now have a per-peer rate limit. Peers
+  sharing a NAT or SSH tunnel no longer compete for one heartbeat quota, and
+  directory traffic no longer consumes the registration budget.
+
 ## [0.8.1] - 2026-09-16
 
 ### Fixed
